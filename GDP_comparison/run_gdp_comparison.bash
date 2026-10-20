@@ -65,10 +65,11 @@ fi
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 post_root="$CAWO_POST/ocean3d"
-gdp_root="/scratch/cawohdcst/data/hindcast_comparison/GDP_comparison"
+gdp_input_root="/scratch/cawohdcst/data/hindcast_comparison/GDP_comparison"
+result_root="$HOME/inacawo-hindcast-validation/GDP_comparison"
 run_id="$start_date-$end_date"
-extracted_root="$gdp_root/extracted/$run_id"
-comparison_out="$gdp_root/comparison_plots/$run_id"
+extracted_root="$result_root/extracted/$run_id"
+comparison_out="$result_root/comparison_plots/$run_id"
 
 if [[ ! -d "$post_root" ]]; then
     echo "Postprocessed ocean3d directory not found: $post_root" >&2
@@ -86,7 +87,7 @@ for ((year_num = start_year; year_num <= end_year; year_num++)); do
     [[ "$year_num" -ne "$start_year" ]] || year_start=$start_date
     [[ "$year_num" -ne "$end_year" ]] || year_end=$end_date
 
-    gdp_file="$gdp_root/$year/drifter_6h_$year.nc"
+    gdp_file="$gdp_input_root/$year/drifter_6h_$year.nc"
     if [[ ! -f "$gdp_file" ]]; then
         echo "GDP input file not found: $gdp_file" >&2
         exit 1
