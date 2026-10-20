@@ -7,9 +7,9 @@ Purpose
 -------
 Given the per-variable NetCDF files produced by save_pressure_series_clean.py,
 save_rh2_series_clean.py, save_u10_series_clean.py and save_v10_series_clean.py
-(domain-mean WRF, ERA5-on-WRF-grid, and WRF-ERA5 difference time series, hourly,
-1995-2014), this script checks whether the WRF solution drifted away from the
-ERA5 boundary/forcing over the 20-year hindcast, and produces a set of
+(domain-mean WRF, ERA5-on-WRF-grid, and WRF-ERA5 difference time series over
+the selected date range), this script checks whether the WRF solution drifted away from the
+ERA5 boundary/forcing during the selected hindcast period, and produces a set of
 publication-style figures plus a CSV table of yearly statistics.
 
 This is NOT an independent skill evaluation against observations. WRF is
@@ -22,17 +22,19 @@ progresses away from each restart/reinitialization.
 Usage
 -----
 python wrf_era5_drift_analysis.py \
-    --pressure pressure_1995_2014.nc \
-    --rh2 rh2_1995_2014.nc \
-    --u10 u10_1995_2014.nc \
-    --v10 v10_1995_2014.nc \
-    --outdir ./figures
+    --pressure pressure_YYYYMMDD_YYYYMMDD.nc \
+    --rh2 rh2_YYYYMMDD_YYYYMMDD.nc \
+    --u10 u10_YYYYMMDD_YYYYMMDD.nc \
+    --v10 v10_YYYYMMDD_YYYYMMDD.nc \
+    --outdir "$RUN_DIR/output/drift_analysis"
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
+import time
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -153,6 +155,16 @@ def qc_summary(data: dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def data_period(data: dict) -> str:
+    """Return the actual inclusive date span present in the loaded series."""
+    timestamps = [df.index for df in data.values() if not df.empty]
+    if not timestamps:
+        return "no data"
+    start = min(index.min() for index in timestamps)
+    end = max(index.max() for index in timestamps)
+    return f"{start:%Y-%m-%d} to {end:%Y-%m-%d}"
+
+
 # ----------------------------------------------------------------------
 # Statistics
 # ----------------------------------------------------------------------
@@ -171,7 +183,9 @@ def annual_stats(df: pd.DataFrame) -> pd.DataFrame:
             }
         )
 
-    out = clean.groupby("year").apply(_agg, include_groups=False)
+    rows = {year: _agg(group) for year, group in clean.groupby("year")}
+    out = pd.DataFrame.from_dict(rows, orient="index", columns=["bias", "rmse", "corr", "n"])
+    out.index.name = "year"
     return out
 
 
@@ -216,7 +230,8 @@ def build_summary_table(data: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
 # Figures
 # ----------------------------------------------------------------------
 def fig_overview_monthly(data: dict, outdir: Path) -> Path:
-    """4-panel figure: monthly-mean WRF vs ERA5 over the full 20-year record."""
+    """4-panel figure: monthly-mean WRF vs ERA5 over the available record."""
+    period = data_period(data)
     fig, axes = plt.subplots(4, 1, figsize=(11, 12), sharex=True)
     for ax, key in zip(axes, VARIABLES):
         df = data[key].loc[~data[key]["flag_bad"]]
@@ -225,7 +240,7 @@ def fig_overview_monthly(data: dict, outdir: Path) -> Path:
         ax.plot(monthly.index, monthly["era5"], color=COLOR_ERA5, lw=1.2, ls="--", label="ERA5")
         meta = VARIABLES[key]
         ax.set_ylabel(f"{meta['short']} ({meta['units']})")
-        ax.set_title(f"{meta['label']}: monthly-mean domain average, 1995-2014", fontsize=11, loc="left")
+        ax.set_title(f"{meta['label']}: monthly-mean domain average, {period}", fontsize=11, loc="left")
         ax.legend(loc="upper right", ncol=2, fontsize=9)
     axes[-1].set_xlabel("Year")
     fig.suptitle("WRF vs ERA5 domain-mean monthly series (QC'd)", y=1.01, fontsize=13)
@@ -238,6 +253,7 @@ def fig_overview_monthly(data: dict, outdir: Path) -> Path:
 
 def fig_difference_smoothed(data: dict, outdir: Path) -> Path:
     """4-panel figure: WRF-ERA5 difference, daily mean + 365-day rolling mean, with zero line."""
+    period = data_period(data)
     fig, axes = plt.subplots(4, 1, figsize=(11, 12), sharex=True)
     for ax, key in zip(axes, VARIABLES):
         df = data[key].loc[~data[key]["flag_bad"]]
@@ -248,7 +264,7 @@ def fig_difference_smoothed(data: dict, outdir: Path) -> Path:
         ax.axhline(0, color="grey", lw=0.8)
         meta = VARIABLES[key]
         ax.set_ylabel(f"WRF-ERA5 ({meta['units']})")
-        ax.set_title(f"{meta['label']}: bias evolution, 1995-2014", fontsize=11, loc="left")
+        ax.set_title(f"{meta['label']}: bias evolution, {period}", fontsize=11, loc="left")
         ax.legend(loc="upper right", ncol=2, fontsize=9)
     axes[-1].set_xlabel("Year")
     fig.suptitle("Daily-mean difference and long-term rolling mean (QC'd)", y=1.01, fontsize=13)
@@ -338,21 +354,29 @@ def fig_qc_flags(data: dict, outdir: Path) -> Path:
 
 
 def fig_seasonal_cycle_bias(data: dict, outdir: Path) -> Path:
-    """Monthly-climatology bias, split into first-half vs second-half of record,
-    to check whether the seasonal-cycle bias itself has drifted."""
+    """Compare monthly-climatology bias in the early and late halves of the record."""
     fig, axes = plt.subplots(2, 2, figsize=(11, 7))
     axes = axes.ravel()
     for ax, key in zip(axes, VARIABLES):
         df = data[key].loc[~data[key]["flag_bad"]].copy()
-        mid_year = 2005
-        first = df[df.index.year < mid_year]
-        second = df[df.index.year >= mid_year]
+        if df.empty:
+            first = second = df
+            first_label = "Early half"
+            second_label = "Late half"
+        else:
+            start = df.index.min()
+            end = df.index.max()
+            midpoint = start + (end - start) / 2
+            first = df[df.index <= midpoint]
+            second = df[df.index > midpoint]
+            first_label = f"Early half ({start:%Y-%m-%d} to {midpoint:%Y-%m-%d})"
+            second_label = f"Late half ({midpoint:%Y-%m-%d} to {end:%Y-%m-%d})"
 
         clim_first = first["difference"].groupby(first.index.month).mean()
         clim_second = second["difference"].groupby(second.index.month).mean()
 
-        ax.plot(clim_first.index, clim_first.values, "o-", label="1995-2004", color="tab:blue")
-        ax.plot(clim_second.index, clim_second.values, "o-", label="2005-2014", color="tab:orange")
+        ax.plot(clim_first.index, clim_first.values, "o-", label=first_label, color="tab:blue")
+        ax.plot(clim_second.index, clim_second.values, "o-", label=second_label, color="tab:orange")
         ax.axhline(0, color="grey", lw=0.8)
         meta = VARIABLES[key]
         ax.set_title(meta["label"], fontsize=10)
@@ -360,9 +384,9 @@ def fig_seasonal_cycle_bias(data: dict, outdir: Path) -> Path:
         ax.set_xlabel("Month")
         ax.set_xticks(range(1, 13))
         ax.legend(fontsize=8)
-    fig.suptitle("Mean seasonal-cycle bias: first vs second decade", y=1.02, fontsize=13)
+    fig.suptitle("Mean seasonal-cycle bias: early vs late half of record", y=1.02, fontsize=13)
     fig.tight_layout()
-    path = outdir / "fig5_seasonal_bias_decades.png"
+    path = outdir / "fig5_seasonal_bias_period_halves.png"
     fig.savefig(path)
     plt.close(fig)
     return path
@@ -377,33 +401,53 @@ def main():
     p.add_argument("--rh2", required=True)
     p.add_argument("--u10", required=True)
     p.add_argument("--v10", required=True)
-    p.add_argument("--outdir", default="./figures")
+    default_outdir = None
+    if os.environ.get("CAWO_HINDCAST_BASE"):
+        default_outdir = str(
+            Path(os.environ["CAWO_HINDCAST_BASE"])
+            / "validation"
+            / "wrf_era5_comparison"
+            / "drift_analysis"
+        )
+    p.add_argument("--outdir", default=default_outdir)
     args = p.parse_args()
+    if args.outdir is None:
+        p.error("--outdir is required when CAWO_HINDCAST_BASE is not set")
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
+    total_started = time.perf_counter()
+    stage_started = time.perf_counter()
     paths = dict(pressure=args.pressure, rh2=args.rh2, u10=args.u10, v10=args.v10)
     data = load_all(paths)
+    print(f"Stage completed: loading input series ({time.perf_counter() - stage_started:.2f} seconds)")
 
+    stage_started = time.perf_counter()
     qc = qc_summary(data)
     qc.to_csv(outdir / "qc_summary.csv", index=False)
     print("QC summary:")
     print(qc.to_string(index=False))
+    print(f"Stage completed: quality-control summary ({time.perf_counter() - stage_started:.2f} seconds)")
 
+    stage_started = time.perf_counter()
     annual_long, trend_table = build_summary_table(data)
     annual_long.to_csv(outdir / "annual_stats_by_variable.csv", index=False)
     trend_table.to_csv(outdir / "drift_trend_table.csv", index=False)
     print("\nDrift trend table (linear slope of yearly bias/RMSE/corr vs year):")
     print(trend_table.to_string(index=False))
+    print(f"Stage completed: annual statistics and trend tests ({time.perf_counter() - stage_started:.2f} seconds)")
 
+    stage_started = time.perf_counter()
     fig_overview_monthly(data, outdir)
     fig_difference_smoothed(data, outdir)
     fig_annual_stats_trend(annual_long, trend_table, outdir)
     fig_qc_flags(data, outdir)
     fig_seasonal_cycle_bias(data, outdir)
+    print(f"Stage completed: figures ({time.perf_counter() - stage_started:.2f} seconds)")
 
     print(f"\nFigures and tables written to: {outdir.resolve()}")
+    print(f"Total drift-analysis time: {time.perf_counter() - total_started:.2f} seconds")
 
 
 if __name__ == "__main__":

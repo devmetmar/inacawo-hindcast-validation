@@ -46,7 +46,7 @@ generate the postprocessed products themselves. The general sequence is:
    read the `ocean3d` product under `$CAWO_POST/ocean3d`; WRF–ERA5 reads
    `wrf2d` under `$CAWO_POST/wrf2d`.
 3. **Run one or more comparison workflows** from the corresponding directory.
-   The launchers load `$HOME/inacawo-iht/setup_env.bash` and use paths and
+   The launchers load the InaCAWO-IHT environment setup and use paths and
    environment variables configured by InaCAWO-IHT.
 4. **Review the generated files and logs** in the workflow-specific output
    locations below.
@@ -67,7 +67,8 @@ Inacawo_validation/
 │   ├── compare_wod_roms_depthmatched.py
 │   └── README.md
 └── WRF_ERA5_comparison/
-    ├── slurm_save_wrf_era5_series_array_clean.bash
+    ├── run_wrf_comparison.bash
+    ├── slurm_save_wrf_era5_series_array_clean.bash  # SLURM array worker
     ├── save_*_series_clean.py
     ├── wrf_era5_series_common_clean.py
     ├── wrf_era5_drift_analysis.py
@@ -124,27 +125,31 @@ Launcher and Slurm logs are in the date-range directory's `logs/` folder.
 
 ### WRF–ERA5: surface fields and drift analysis
 
-From a shell with InaCAWO-IHT configured, submit the four-task Slurm array:
+From a shell with InaCAWO-IHT configured, run the comparison:
 
 ```bash
 cd /path/to/Inacawo_validation/WRF_ERA5_comparison
-./slurm_save_wrf_era5_series_array_clean.bash --start YYYYMMDD --end YYYYMMDD
+./run_wrf_comparison.bash --start YYYYMMDD --end YYYYMMDD
 ```
 
 The inclusive date range is used to extract mean sea-level pressure, 10 m
 eastward wind (`u10`), 10 m northward wind (`v10`), and 2 m relative humidity
-(`rh2`) from postprocessed WRF and compare/regrid against ERA5. The launcher
-submits one Slurm array with four tasks. By default it uses the `DEV1`
+(`rh2`) from postprocessed WRF and compare/regrid against ERA5. The launcher sources
+`${WORK_BASE:-$HOME/inacawo-iht}/setup_env.bash`, submits one Slurm array with
+four tasks, and waits for it to complete. By default it uses the `DEV1`
 partition; `IHT_SLURM_PARTITION` can select another partition.
 
 The postprocessed WRF product is `$CAWO_POST/wrf2d`; ERA5 and the bilinear
-regridding weights are read from the configured shared paths. The four
-compressed NetCDF time-series files and Slurm logs are written under the
-`WRF_ERA5_comparison/output/` and `WRF_ERA5_comparison/logs/` directories.
-After all extraction tasks finish, drift analysis can be run separately with
-`wrf_era5_drift_analysis.py`; see the workflow README for the command and
-options. The analysis writes CSV summaries and figures to its selected output
-directory.
+regridding weights default to the existing shared paths (optional environment
+overrides are documented in the workflow README). All run outputs and logs are
+written below
+`$CAWO_HINDCAST_BASE/validation/wrf_era5_comparison/<start>_<end>/`, in a
+unique run directory. After all extraction tasks succeed, the launcher also
+runs drift analysis automatically. The run directory contains the four
+NetCDF series, drift-analysis CSV summaries and figures, plus logs. Each
+array-task log includes its elapsed time; `launcher.log` records extraction,
+analysis, and end-to-end elapsed times. See the workflow README for output
+names and details.
 
 ## Environment and operational notes
 

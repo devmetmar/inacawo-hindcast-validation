@@ -5,21 +5,15 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=50G
 #SBATCH --time=30:00:00
-#SBATCH --output=logs/wrf_era5_ts_%A_%a.out
-#SBATCH --error=logs/wrf_era5_ts_%A_%a.err
 
+# Internal worker for run_wrf_comparison.bash; do not submit directly.
 set -euo pipefail
 
-SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
-SCRIPT_DIR="$(dirname "${SCRIPT_PATH}")"
+SCRIPT_DIR="${WRF_ERA5_SCRIPT_DIR:?Missing source directory submitted by run_wrf_comparison.bash}"
 PYTHON_BIN="python"
-ERA5_ROOT="/scratch/cawohdcst/data/era5"
-WEIGHTS_FILE="/scratch/cawohdcst/data/postprocessed/weights_era5_to_wrf_bilinear.nc"
+ERA5_ROOT="${WRF_ERA5_ERA5_ROOT:-/scratch/cawohdcst/data/era5}"
+WEIGHTS_FILE="${WRF_ERA5_WEIGHTS_FILE:-/scratch/cawohdcst/data/postprocessed/weights_era5_to_wrf_bilinear.nc}"
 CHUNK_SIZE=24
-
-usage() {
-  echo "Usage: $0 --start YYYYMMDD --end YYYYMMDD"
-}
 
 validate_date() {
   local value="$1"
@@ -27,80 +21,20 @@ validate_date() {
   [[ "$(date -d "${value}" +%Y%m%d 2>/dev/null)" == "${value}" ]]
 }
 
-if [[ -z "${SLURM_JOB_ID:-}" ]]; then
-  START_DATE=""
-  END_DATE=""
-
-  while (($#)); do
-    case "$1" in
-      --start)
-        (($# >= 2)) || { usage >&2; exit 2; }
-        START_DATE="$2"
-        shift 2
-        ;;
-      --end)
-        (($# >= 2)) || { usage >&2; exit 2; }
-        END_DATE="$2"
-        shift 2
-        ;;
-      -h|--help)
-        usage
-        exit 0
-        ;;
-      *)
-        echo "Unknown argument: $1" >&2
-        usage >&2
-        exit 2
-        ;;
-    esac
-  done
-
-  if ! validate_date "${START_DATE}" || ! validate_date "${END_DATE}"; then
-    echo "Both --start and --end must be valid dates in YYYYMMDD format." >&2
-    exit 2
-  fi
-  if [[ "${END_DATE}" < "${START_DATE}" ]]; then
-    echo "--end must not be earlier than --start." >&2
-    exit 2
-  fi
-
-  IHT_ROOT="${WORK_BASE:-${HOME}/inacawo-iht}"
-  SETUP_ENV="${IHT_ROOT}/setup_env.bash"
-  if [[ ! -f "${SETUP_ENV}" ]]; then
-    echo "InaCAWO setup script not found: ${SETUP_ENV}" >&2
-    exit 1
-  fi
-  # shellcheck source=/dev/null
-  source "${SETUP_ENV}"
-  : "${CAWO_POST:?setup_env.bash did not define CAWO_POST}"
-  if [[ ! -d "${CAWO_POST}/wrf2d" ]]; then
-    echo "Postprocessed WRF directory not found: ${CAWO_POST}/wrf2d" >&2
-    exit 1
-  fi
-  if [[ ! -d "${ERA5_ROOT}" ]]; then
-    echo "ERA5 directory not found: ${ERA5_ROOT}" >&2
-    exit 1
-  fi
-
-  mkdir -p "${SCRIPT_DIR}/logs"
-  sbatch_args=(
-    --chdir="${SCRIPT_DIR}"
-    --array="0-3%4"
-    --output="${SCRIPT_DIR}/logs/wrf_era5_ts_%A_%a.out"
-    --error="${SCRIPT_DIR}/logs/wrf_era5_ts_%A_%a.err"
-    --export="ALL,WRF_ERA5_START_DATE=${START_DATE},WRF_ERA5_END_DATE=${END_DATE}"
-  )
-  sbatch_args+=(--partition="${IHT_SLURM_PARTITION:-DEV1}")
-  echo "Submitting WRF/ERA5 comparison for ${START_DATE}-${END_DATE}"
-  echo "WRF input: ${CAWO_POST}/wrf2d"
-  echo "ERA5 input: ${ERA5_ROOT}"
-  echo "Output: ${SCRIPT_DIR}/output"
-  sbatch --parsable "${sbatch_args[@]}" "${SCRIPT_PATH}"
-  exit
-fi
+TASK_STARTED_SECONDS=$SECONDS
+finish_task() {
+  local status=$?
+  trap - EXIT
+  local elapsed=$((SECONDS - TASK_STARTED_SECONDS))
+  printf 'Task %s finished with exit status %s; elapsed time: %s seconds\n' \
+    "${SLURM_ARRAY_TASK_ID:-unknown}" "${status}" "${elapsed}"
+  exit "${status}"
+}
+trap finish_task EXIT
 
 START_DATE="${WRF_ERA5_START_DATE:?Missing submitted --start date}"
 END_DATE="${WRF_ERA5_END_DATE:?Missing submitted --end date}"
+RUN_DIR="${WRF_ERA5_RUN_DIR:?Missing submitted run directory}"
 if ! validate_date "${START_DATE}" || ! validate_date "${END_DATE}"; then
   echo "Invalid submitted date range: ${START_DATE}-${END_DATE}" >&2
   exit 2
@@ -121,7 +55,7 @@ source "${SETUP_ENV}"
 : "${CAWO_POST:?setup_env.bash did not define CAWO_POST}"
 
 WRF_DIR="${CAWO_POST}/wrf2d"
-OUT_DIR="${SCRIPT_DIR}/output"
+OUT_DIR="${RUN_DIR}/output"
 mkdir -p "${OUT_DIR}"
 if [[ ! -d "${WRF_DIR}" ]]; then
   echo "Postprocessed WRF directory not found: ${WRF_DIR}" >&2
@@ -154,6 +88,11 @@ case "${SLURM_ARRAY_TASK_ID:?This script must run as an array job}" in
     exit 2
     ;;
 esac
+
+if [[ ! -f "${SCRIPT_DIR}/${SCRIPT}" ]]; then
+  echo "Python driver script not found: ${SCRIPT_DIR}/${SCRIPT}" >&2
+  exit 1
+fi
 
 OUTPUT="${OUT_DIR}/${VARIABLE}_${START_DATE}_${END_DATE}.nc"
 

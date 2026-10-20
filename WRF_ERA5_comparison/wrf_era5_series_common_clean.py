@@ -82,15 +82,54 @@ def to_hpa(da: xr.DataArray) -> xr.DataArray:
     return out
 
 
-def open_wrf_year(wrf_dir: str, year: int, wrf_variable: str) -> xr.Dataset:
-    """Open all postprocessed WRF 2-D files for one calendar year."""
-    pattern = f"{wrf_dir}/f{year}*/inacawo_hindcast_wrf2d_{year}-*.nc"
-    files = sorted(glob(pattern))
+def open_wrf_year(
+    wrf_dir: str,
+    year: int,
+    wrf_variable: str,
+    start_time: pd.Timestamp | None = None,
+    end_time: pd.Timestamp | None = None,
+) -> xr.Dataset:
+    """Open postprocessed WRF 2-D files for a year, limited to requested days."""
+    if start_time is not None and end_time is not None:
+        year_start = pd.Timestamp(year=year, month=1, day=1)
+        year_end = pd.Timestamp(year=year + 1, month=1, day=1)
+        range_start = max(start_time, year_start).normalize()
+        range_end = min(end_time, year_end)
+        if range_start >= range_end:
+            raise ValueError(f"Requested date range does not overlap year {year}")
+
+        last_day = (range_end - pd.Timedelta(nanoseconds=1)).normalize()
+        patterns = (
+            f"{wrf_dir}/f{day:%Y%m%d}/inacawo_hindcast_wrf2d_{year}-*.nc"
+            for day in pd.date_range(range_start, last_day, freq="D")
+        )
+        files = sorted(filename for pattern in patterns for filename in glob(pattern))
+        pattern = f"{wrf_dir}/fYYYYMMDD/inacawo_hindcast_wrf2d_{year}-*.nc within requested dates"
+    else:
+        pattern = f"{wrf_dir}/f{year}*/inacawo_hindcast_wrf2d_{year}-*.nc"
+        files = sorted(glob(pattern))
+
     if not files:
         raise FileNotFoundError(f"No WRF files found with pattern: {pattern}")
 
-    print(f"{year}: found {len(files)} WRF files", flush=True)
-    ds = xr.open_mfdataset(files, combine="by_coords")
+    print(f"{year}: opening {len(files)} WRF files for requested days", flush=True)
+
+    def select_required_wrf_data(dataset: xr.Dataset) -> xr.Dataset:
+        names = [
+            name
+            for name in (wrf_variable, "TSTEP", "ROW", "COL")
+            if name in dataset
+        ]
+        return dataset[names]
+
+    ds = xr.open_mfdataset(
+        files,
+        combine="by_coords",
+        preprocess=select_required_wrf_data,
+        data_vars="minimal",
+        coords="minimal",
+        compat="override",
+    )
 
     if wrf_variable not in ds:
         ds.close()
@@ -126,18 +165,57 @@ def _open_required_era5_variables(grib_file: str, required: Iterable[str]) -> xr
     return xr.Dataset(found)
 
 
-def open_era5_year(era5_root: str, year: int, required: tuple[str, ...]) -> xr.Dataset:
-    """Open required ERA5 variables for one year and standardize coordinates."""
-    pattern = f"{era5_root}/era5_{year}*/era5_surface_part*.grib"
-    files = sorted(glob(pattern))
+def open_era5_year(
+    era5_root: str,
+    year: int,
+    required: tuple[str, ...],
+    start_time: pd.Timestamp | None = None,
+    end_time: pd.Timestamp | None = None,
+) -> xr.Dataset:
+    """Open required ERA5 variables for a year, limited to requested times."""
+    if start_time is not None and end_time is not None:
+        year_start = pd.Timestamp(year=year, month=1, day=1)
+        year_end = pd.Timestamp(year=year + 1, month=1, day=1)
+        range_start = max(start_time, year_start).normalize()
+        range_end = min(end_time, year_end)
+        if range_start >= range_end:
+            raise ValueError(f"Requested date range does not overlap year {year}")
+
+        last_day = (range_end - pd.Timedelta(nanoseconds=1)).normalize()
+        patterns = (
+            f"{era5_root}/era5_{day:%Y%m%d}*/era5_surface_part*.grib"
+            for day in pd.date_range(range_start, last_day, freq="D")
+        )
+        files = sorted(filename for pattern in patterns for filename in glob(pattern))
+        pattern = f"{era5_root}/era5_YYYYMMDD*/era5_surface_part*.grib within requested dates"
+    else:
+        pattern = f"{era5_root}/era5_{year}*/era5_surface_part*.grib"
+        files = sorted(glob(pattern))
+
     if not files:
         raise FileNotFoundError(f"No ERA5 files found with pattern: {pattern}")
 
-    print(f"{year}: found {len(files)} ERA5 files", flush=True)
+    print(f"{year}: found {len(files)} ERA5 files for requested days", flush=True)
     pieces = []
     for filename in files:
         print(f"{year}: opening {filename}", flush=True)
-        pieces.append(_open_required_era5_variables(filename, required))
+        piece = _open_required_era5_variables(filename, required)
+        if start_time is not None and end_time is not None:
+            piece = piece.sel(
+                time=slice(
+                    start_time,
+                    end_time - pd.Timedelta(nanoseconds=1),
+                )
+            )
+            if piece.sizes.get("time", 0) == 0:
+                piece.close()
+                continue
+        pieces.append(piece)
+
+    if not pieces:
+        raise ValueError(
+            f"No ERA5 time records found for {year} within the requested date range"
+        )
 
     ds = xr.concat(pieces, dim="time", compat="override", coords="minimal")
     ds = ds.sortby("time")
@@ -236,10 +314,22 @@ def extract_year_series(
     end_time: pd.Timestamp | None = None,
 ) -> xr.Dataset:
     """Calculate WRF, ERA5, and WRF-minus-ERA5 domain means for one year."""
-    ds_wrf = open_wrf_year(wrf_dir, year, wrf_variable)
-    ds_era = open_era5_year(era5_root, year, era5_variables)
-
+    ds_wrf = open_wrf_year(
+        wrf_dir,
+        year,
+        wrf_variable,
+        start_time=start_time,
+        end_time=end_time,
+    )
+    ds_era = None
     try:
+        ds_era = open_era5_year(
+            era5_root,
+            year,
+            era5_variables,
+            start_time=start_time,
+            end_time=end_time,
+        )
         if start_time is not None and end_time is not None:
             ds_wrf = ds_wrf.where(
                 (ds_wrf["time"] >= start_time) & (ds_wrf["time"] < end_time),
@@ -273,7 +363,7 @@ def extract_year_series(
             wrf_chunk = wrf_full.isel(time=slice(start, end))
             target_times = wrf_chunk["time"]
 
-            # Exact matching is intentional: both products should be hourly here.
+            # Match ERA5 at each available WRF timestamp; do not interpolate in time.
             if relative_humidity:
                 era_native = rh_from_t_tdew(
                     ds_era[era5_variables[0]].sel(time=target_times),
@@ -341,7 +431,8 @@ def extract_year_series(
         return output
     finally:
         ds_wrf.close()
-        ds_era.close()
+        if ds_era is not None:
+            ds_era.close()
 
 
 def run_year_range(
