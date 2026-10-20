@@ -3,7 +3,7 @@
 
 """
 Compare WOD CTD observations with ROMS using the depth-matched files produced by
-match_roms2wod_depths_fixed.py.
+match_roms2wod_depths.py.
 
 The matched files are expected to contain, for each accepted ROMS/WOD depth pair:
 
@@ -35,8 +35,8 @@ The script:
 
 Example:
     python compare_wod_roms_depthmatched.py \
-        /home/cawohdcst/WOD_comparison/1995_2014/roms_wod_depthmatched \
-        /home/cawohdcst/WOD_comparison/1995_2014/comparison_depthmatched
+        "$CAWO_HINDCAST_BASE/validation/wod_comparison/YYYYMMDD_YYYYMMDD/jobs/<job-id>_<restart>/roms_wod_depthmatched" \
+        "$CAWO_HINDCAST_BASE/validation/wod_comparison/YYYYMMDD_YYYYMMDD/jobs/<job-id>_<restart>/comparison_depthmatched"
 
 Optional:
     --years 1995 1996 1997
@@ -66,24 +66,36 @@ DEFAULT_ROMS_DEPTHS = np.array(
     dtype=float,
 )
 
-# Some depth-matched files (from an unpatched/older matching run) can still
-# contain pairs where the ROMS profile came from a masked/land grid cell and
-# was written as an exact fill value at every level (0.0 in this pipeline).
-# QC screening below rejects those defensively, in addition to whatever
-# screening extract_postprocessed_roms2wod.py / match_roms2wod_depths.py do
-# upstream.
+# Some depth-matched files from older runs can contain profiles written as
+# exact fill values at every level (0.0 in this pipeline). QC screening below
+# rejects those defensively, in addition to the upstream profile checks.
 LAND_FILL_VALUE = 0.0
 
 
 def parse_year(value) -> int | None:
     """Extract year from a time-like value/string. Return None if unavailable."""
     try:
-        t = pd.to_datetime(value)
+        t = parse_timestamp(value)
         if pd.isna(t):
             return None
         return int(t.year)
     except Exception:
         return None
+
+
+def parse_timestamp(value):
+    """Parse ISO timestamps and legacy nanosecond timestamps stored as strings."""
+    if isinstance(value, (int, np.integer)):
+        return pd.to_datetime(value, unit="ns", errors="coerce")
+
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.isdigit() or (
+            stripped.startswith("-") and stripped[1:].isdigit()
+        ):
+            return pd.to_datetime(int(stripped), unit="ns", errors="coerce")
+
+    return pd.to_datetime(value, errors="coerce")
 
 
 def safe_float(value, default=np.nan):
@@ -382,8 +394,11 @@ def load_all_matches(
 ) -> pd.DataFrame:
     files = sorted(input_dir.glob(roms_glob))
     if not files:
-        raise FileNotFoundError(
-            f"No files matching {roms_glob!r} found in {input_dir}"
+        raise RuntimeError(
+            f"No depth-matched cast files matching {roms_glob!r} were found in "
+            f"{input_dir}. The comparison cannot be computed because the "
+            "depth-matching stage produced no valid casts; review its log for "
+            "casts skipped because extracted ROMS profiles contained only fill values."
         )
 
     records = []
@@ -409,14 +424,25 @@ def load_all_matches(
 
                 nmatch = int(ds.sizes.get("match", 0))
                 if nmatch == 0:
+                    print(f"  [WARN] {path.name}: no matched depth levels; skipping")
                     continue
 
                 wod_time = ds.attrs.get("wod_time", "")
                 year = parse_year(wod_time)
 
                 if start_time is not None:
-                    cast_time = pd.to_datetime(wod_time, errors="coerce")
-                    if pd.isna(cast_time) or not (start_time <= cast_time < end_time):
+                    cast_time = parse_timestamp(wod_time)
+                    if pd.isna(cast_time):
+                        print(
+                            f"  [WARN] {path.name}: missing or invalid wod_time "
+                            f"attribute {wod_time!r}; cannot apply date filter; skipping"
+                        )
+                        continue
+                    if not (start_time <= cast_time < end_time):
+                        print(
+                            f"  [WARN] {path.name}: wod_time {cast_time} is outside "
+                            "the requested date range; skipping"
+                        )
                         continue
 
                 if selected_years is not None:
@@ -559,9 +585,8 @@ def make_qc_table(
         & (df[flag_col].values <= qc_max)
     )
 
-    # Defensive screen for masked/land ROMS grid cells that slipped through
-    # upstream: a matched pair where both the raw ROMS temperature and raw
-    # ROMS salinity are exactly the fill value is not real ocean data.
+    # Reject matched pairs where both raw ROMS temperature and salinity are
+    # exactly the fill value; isolated near-zero ocean values remain valid.
     invalid_roms_point = (df["roms_temp"].values == LAND_FILL_VALUE) & (
         df["roms_salt"].values == LAND_FILL_VALUE
     )

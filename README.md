@@ -117,7 +117,10 @@ submits one Slurm job, which runs these stages in order:
 The WOD input is the configured 1995–2014 CTD NetCDF file. ROMS input is
 `$CAWO_POST/ocean3d`. Results, including intermediate extraction and
 depth-matched data, comparison output, and Slurm logs, are written under
-`$CAWO_HINDCAST_BASE/wod_comparison/<start>_<end>/`.
+`$CAWO_HINDCAST_BASE/validation/wod_comparison/<start>_<end>/`. Each Slurm
+attempt gets a separate `jobs/<job-id>_<restart>/` output directory, preserving
+older results and preventing stale intermediate files from being reused.
+Launcher and Slurm logs are in the date-range directory's `logs/` folder.
 
 ### WRF–ERA5: surface fields and drift analysis
 

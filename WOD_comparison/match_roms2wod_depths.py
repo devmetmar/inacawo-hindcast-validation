@@ -21,11 +21,10 @@ Only successfully depth-matched levels are written.
 
 CHANGES vs the original version
 --------------------------------
-1. Defensive land/fill screen. extract_postprocessed_roms2wod.py should now
-   skip masked/land grid points at the source (see LAND_FILL_VALUE there),
-   but this script re-checks the ROMS profile it reads and skips the cast if
-   it still looks like an all-fill (e.g. all-zero) profile, so a bad
-   extraction directory can't silently poison the comparison again.
+1. Defensive fill-value screen. extract_postprocessed_roms2wod.py searches
+   the nearest grid cell and immediate neighbors for a valid profile. This
+   script re-checks extracted profiles and skips all-fill (e.g. all-zero)
+   profiles so invalid data cannot silently enter the comparison.
 2. TEOS-10 (gsw) fields. ROMS TEMP/SALT are almost certainly *potential*
    temperature and *practical* salinity (the standard ROMS prognostic
    variables), whereas WOD Temperature is measured in-situ. This script now
@@ -51,21 +50,6 @@ import xarray as xr
 import gsw
 
 
-# -----------------------------------------------------------------------------
-# USER SETTINGS
-# -----------------------------------------------------------------------------
-WOD_FILE = Path(
-    "/home/cawohdcst/WOD_comparison/1995_2014/ocldb1786200299.1695566_CTD.nc"
-)
-
-ROMS_EXTRACTED_DIR = Path(
-    "/home/cawohdcst/WOD_comparison/1995_2014/roms_extracted"
-)
-
-OUTPUT_DIR = Path(
-    "/home/cawohdcst/WOD_comparison/1995_2014/roms_wod_depthmatched"
-)
-
 MAX_DEPTH_DIFFERENCE_M = 5.0
 
 # Same fill-value convention as extract_postprocessed_roms2wod.py. Kept in
@@ -84,6 +68,21 @@ def ragged_start_indices(row_sizes):
     if row_sizes.size > 1:
         starts[1:] = np.cumsum(row_sizes[:-1])
     return starts
+
+
+def read_ragged_row_sizes(ds, name):
+    """Read ragged row sizes, treating missing profiles as zero-length rows."""
+    values = np.asarray(ds[name].values, dtype=float)
+    missing = ~np.isfinite(values)
+    if missing.any():
+        print(
+            f"WARNING: {name} has {int(missing.sum())} missing row sizes; "
+            "treating them as empty profiles."
+        )
+        values[missing] = 0
+    if np.any(values < 0) or np.any(values != np.floor(values)):
+        raise ValueError(f"{name} must contain non-negative integer row sizes.")
+    return values.astype(np.int64)
 
 
 def get_cast_slice(values, starts, row_sizes, icast):
@@ -146,7 +145,10 @@ def safe_cast_scalar(ds, name, icast, default=np.nan):
         return default
     try:
         value = ds[name].isel(casts=icast).values
-        return np.asarray(value).squeeze().item()
+        scalar = np.asarray(value).squeeze()
+        if np.issubdtype(scalar.dtype, np.datetime64):
+            return pd.Timestamp(scalar).isoformat()
+        return scalar.item()
     except Exception:
         return default
 
@@ -230,9 +232,24 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--start", help="First hindcast day, YYYYMMDD (inclusive)")
     parser.add_argument("--end", help="Last hindcast day, YYYYMMDD (inclusive)")
-    parser.add_argument("--wod-file", type=Path, default=WOD_FILE)
-    parser.add_argument("--roms-extracted-dir", type=Path, default=ROMS_EXTRACTED_DIR)
-    parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
+    parser.add_argument(
+        "--wod-file",
+        type=Path,
+        required=True,
+        help="Shared WOD CTD NetCDF input file.",
+    )
+    parser.add_argument(
+        "--roms-extracted-dir",
+        type=Path,
+        required=True,
+        help="Directory containing extracted per-cast ROMS profiles.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        required=True,
+        help="Directory for depth-matched per-cast output files.",
+    )
     args = parser.parse_args()
 
     start_time, end_time = date_window(args.start, args.end)
@@ -258,9 +275,9 @@ def main():
         ncasts = int(ds_wod.sizes["casts"])
 
         # Ragged-array row sizes and start positions.
-        z_row_size = ds_wod["z_row_size"].values.astype(np.int64)
-        t_row_size = ds_wod["Temperature_row_size"].values.astype(np.int64)
-        s_row_size = ds_wod["Salinity_row_size"].values.astype(np.int64)
+        z_row_size = read_ragged_row_sizes(ds_wod, "z_row_size")
+        t_row_size = read_ragged_row_sizes(ds_wod, "Temperature_row_size")
+        s_row_size = read_ragged_row_sizes(ds_wod, "Salinity_row_size")
 
         z_start = ragged_start_indices(z_row_size)
         t_start = ragged_start_indices(t_row_size)
@@ -372,7 +389,7 @@ def main():
             if looks_like_fill(roms_temp, roms_salt):
                 print(
                     f"SKIP cast {cast_id}: extracted ROMS profile is all fill "
-                    f"({LAND_FILL_VALUE}); nearest grid point was masked/land."
+                    f"({LAND_FILL_VALUE}); no usable temperature/salinity values."
                 )
                 n_fill += 1
                 continue
@@ -443,7 +460,7 @@ def main():
                 attrs={
                     "wod_cast": str(cast_id),
                     "wod_profile_index": int(icast),
-                    "wod_time": str(safe_cast_scalar(ds_wod, "time", icast, "")),
+                    "wod_time": wod_time.isoformat(),
                     "wod_lat": wod_lat,
                     "wod_lon": wod_lon,
                     "max_depth_difference_m": float(MAX_DEPTH_DIFFERENCE_M),
@@ -462,6 +479,9 @@ def main():
                     "roms_time": str(roms_attrs.get("roms_time", "")),
                     "roms_lat": roms_attrs.get("roms_lat", np.nan),
                     "roms_lon": roms_attrs.get("roms_lon", np.nan),
+                    "roms_grid_distance_km": roms_attrs.get(
+                        "roms_grid_distance_km", np.nan
+                    ),
                     "time_difference_hours": roms_attrs.get(
                         "time_difference_hours", np.nan
                     ),
@@ -498,7 +518,7 @@ def main():
     print(f"  cast files written: {n_written}")
     print(f"  total matched depth pairs: {total_matches}")
     print(f"  casts without extracted ROMS file: {n_no_roms}")
-    print(f"  casts skipped as masked/land (all-fill ROMS profile): {n_fill}")
+    print(f"  casts skipped for all-fill ROMS profiles: {n_fill}")
     print(f"  casts with no depth match within {MAX_DEPTH_DIFFERENCE_M:.1f} m: {n_no_match}")
     print(f"  output directory: {args.output_dir}")
 

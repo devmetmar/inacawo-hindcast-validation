@@ -43,18 +43,22 @@ by this entrypoint.
 
 GDP input files are read from
 `/scratch/cawohdcst/data/hindcast_comparison/GDP_comparison/`. Results are
-written under `$HOME/inacawo-hindcast-validation/GDP_comparison/`:
+written under `$CAWO_HINDCAST_BASE/validation/`:
 
 - Extracted GDP records with ROMS currents:
   `extracted/YYYYMMDD-YYYYMMDD/YYYY/gdp_roms_uv10m_<drifter-id>.nc`
 - Comparison figures:
   `comparison_plots/YYYYMMDD-YYYYMMDD/YYYY/` and
   `comparison_plots/YYYYMMDD-YYYYMMDD/ALL/`
+- Launcher logs:
+  `logs/gdp_comparison_YYYYMMDD-YYYYMMDD_<timestamp>.log`
 
 Each year folder and the `ALL` folder contain the zonal/meridional time series,
 speed PDF, CDF and QQ plots, and direction distribution and difference plots.
 The comparison script also prints sample counts and velocity bias, RMSE, and
-correlation statistics to the console.
+correlation statistics to the console. The launcher log captures console
+output and records each extraction and plotting stage's start, end, result,
+and duration, followed by the summed stage duration and total launcher runtime.
 
 The environment loaded by `setup_env.bash` must provide the Python packages
 used by the scripts, including `numpy`, `pandas`, `xarray`, `matplotlib`, and

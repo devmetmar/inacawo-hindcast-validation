@@ -16,40 +16,27 @@ One output NetCDF file is written per WOD cast, analogous to the original
 extract_roms2wod.py workflow.
 
 Use --roms-dir to select the postprocessed ocean3d directory. The supported
-run_wod_comparison.bash entrypoint supplies the path from $CAWO_POST.
+run_wod_comparison.bash entrypoint supplies the path from $CAWO_POST. If the
+nearest grid cell contains only fill values, the immediate neighboring cells
+are checked and the nearest valid ROMS profile is selected.
 """
 
 from pathlib import Path
 import argparse
-import os
 import re
 import numpy as np
 import pandas as pd
 import xarray as xr
 
 
-# -----------------------------------------------------------------------------
-# USER SETTINGS
-# -----------------------------------------------------------------------------
-WOD_FILE = Path(
-    "/home/cawohdcst/WOD_comparison/1995_2014/ocldb1786200299.1695566_CTD.nc"
-)
-
-# Directory containing the postprocessed ROMS ocean3d files.
-# Change this if needed.
-ROMS_DIR = Path(
-    os.environ.get("CAWO_POST", "/scratch/cawohdcst/data/postprocessed")
-) / "ocean3d"
-
-# Recursive glob makes the script work whether files are directly in ROMS_DIR
-# or inside fYYYYMMDD subdirectories. Tighten this pattern if desired.
+# Files are normally stored under daily fYYYYMMDD folders. The extractor
+# falls back to this recursive glob when no matching daily-folder files exist.
 ROMS_GLOB = "**/*.nc"
-
-OUTPUT_DIR = Path("/home/cawohdcst/WOD_comparison/1995_2014/roms_extracted")
 
 # Maximum allowed separation between a WOD cast and the closest ROMS output.
 # Set to None to disable the check.
 MAX_TIME_DIFFERENCE = pd.Timedelta("24h")
+WET_CELL_SEARCH_RADIUS = 1
 
 # -----------------------------------------------------------------------------
 # HELPERS
@@ -137,6 +124,39 @@ def build_roms_time_index(files, cache_file, roms_dir, roms_glob):
     return idx
 
 
+def find_roms_files(roms_dir, roms_glob, start_time, end_time):
+    """Find ROMS files only in daily folders overlapping the requested dates."""
+    if start_time is None:
+        return sorted(roms_dir.glob(roms_glob))
+
+    first_day = start_time.normalize()
+    last_day = (end_time - pd.Timedelta(nanoseconds=1)).normalize()
+    daily_dirs = [
+        roms_dir / f"f{day:%Y%m%d}"
+        for day in pd.date_range(first_day, last_day, freq="D")
+    ]
+    print(
+        f"Searching daily ROMS directories f{first_day:%Y%m%d} "
+        f"through f{last_day:%Y%m%d} ..."
+    )
+
+    files = []
+    for daily_dir in daily_dirs:
+        if daily_dir.is_dir():
+            files.extend(daily_dir.glob(roms_glob))
+
+    files = sorted(set(files))
+    if files:
+        print(f"Found {len(files)} candidate ROMS files in requested daily directories.")
+        return files
+
+    print(
+        "WARNING: no date-specific ROMS files found; "
+        f"falling back to full search under {roms_dir}."
+    )
+    return sorted(roms_dir.glob(roms_glob))
+
+
 def nearest_file(target_time, roms_index):
     """Return closest ROMS file, model time, and absolute time difference."""
     times = roms_index["time"].values.astype("datetime64[ns]")
@@ -152,6 +172,61 @@ def nearest_1d_index(values, target):
     """Index of nearest value in a 1-D coordinate."""
     values = np.asarray(values, dtype=float)
     return int(np.nanargmin(np.abs(values - float(target))))
+
+
+def haversine_distance_km(lon1, lat1, lon2, lat2):
+    """Calculate great-circle distance between two points in kilometers."""
+    earth_radius_km = 6371.0088
+    lon1, lat1, lon2, lat2 = np.deg2rad([lon1, lat1, lon2, lat2])
+    delta_lon = (lon2 - lon1 + np.pi) % (2 * np.pi) - np.pi
+    delta_lat = lat2 - lat1
+    a = (
+        np.sin(delta_lat / 2) ** 2
+        + np.cos(lat1) * np.cos(lat2) * np.sin(delta_lon / 2) ** 2
+    )
+    return float(2 * earth_radius_km * np.arcsin(np.sqrt(a)))
+
+
+def profile_has_valid_ocean_data(temp, salt):
+    """Return whether a profile has at least one finite, non-fill T/S level."""
+    temp = np.asarray(temp, dtype=float)
+    salt = np.asarray(salt, dtype=float)
+    valid = np.isfinite(temp) & np.isfinite(salt)
+    valid &= (temp != 0.0) | (salt != 0.0)
+    return bool(np.any(valid))
+
+
+def nearest_valid_grid_cell(
+    lat_values,
+    lon_values,
+    temp_patch,
+    salt_patch,
+    row_start,
+    col_start,
+    target_lat,
+    target_lon,
+):
+    """Choose the nearest wet cell in a loaded grid patch, if one is valid."""
+    candidates = []
+    for local_row in range(temp_patch.shape[1]):
+        row = row_start + local_row
+        for local_col in range(temp_patch.shape[2]):
+            col = col_start + local_col
+            temp_profile = temp_patch[:, local_row, local_col]
+            salt_profile = salt_patch[:, local_row, local_col]
+            if not profile_has_valid_ocean_data(temp_profile, salt_profile):
+                continue
+
+            model_lat = float(lat_values[row])
+            model_lon = float(lon_values[col])
+            distance = haversine_distance_km(
+                target_lon, target_lat, model_lon, model_lat
+            )
+            candidates.append((distance, row, col))
+
+    if not candidates:
+        return None
+    return min(candidates)
 
 
 def date_window(start, end):
@@ -175,21 +250,33 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--start", help="First hindcast day, YYYYMMDD (inclusive)")
     parser.add_argument("--end", help="Last hindcast day, YYYYMMDD (inclusive)")
-    parser.add_argument("--wod-file", type=Path, default=WOD_FILE)
+    parser.add_argument(
+        "--wod-file",
+        type=Path,
+        required=True,
+        help="Shared WOD CTD NetCDF input file.",
+    )
     parser.add_argument(
         "--roms-dir",
         type=Path,
-        default=ROMS_DIR,
+        required=True,
         help="Postprocessed ROMS ocean3d directory (normally $CAWO_POST/ocean3d).",
     )
-    parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        required=True,
+        help="Directory for extracted per-cast ROMS profiles.",
+    )
     parser.add_argument("--roms-glob", default=ROMS_GLOB)
     args = parser.parse_args()
 
     start_time, end_time = date_window(args.start, args.end)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    roms_files = sorted(args.roms_dir.glob(args.roms_glob))
+    roms_files = find_roms_files(
+        args.roms_dir, args.roms_glob, start_time, end_time
+    )
     if not roms_files:
         raise FileNotFoundError(
             f"No files found under {args.roms_dir} using pattern {args.roms_glob!r}."
@@ -266,14 +353,47 @@ def main():
                         if required not in ds_roms:
                             raise KeyError(f"{required!r} missing from {roms_file}")
 
-                    # Postprocessed grid is regular with 1-D lat/lon coordinates.
-                    irow = nearest_1d_index(ds_roms["lat"].values, target_lat)
-                    icol = nearest_1d_index(ds_roms["lon"].values, target_lon)
+                    # Search only the nearest cell and its immediate neighbors.
+                    lat_values = np.asarray(ds_roms["lat"].values, dtype=float)
+                    lon_values = np.asarray(ds_roms["lon"].values, dtype=float)
+                    center_row = nearest_1d_index(lat_values, target_lat)
+                    center_col = nearest_1d_index(lon_values, target_lon)
+                    row_start = max(0, center_row - WET_CELL_SEARCH_RADIUS)
+                    row_stop = min(
+                        len(lat_values), center_row + WET_CELL_SEARCH_RADIUS + 1
+                    )
+                    col_start = max(0, center_col - WET_CELL_SEARCH_RADIUS)
+                    col_stop = min(
+                        len(lon_values), center_col + WET_CELL_SEARCH_RADIUS + 1
+                    )
 
-                    # Each postprocessed file normally has one TSTEP. isel(0) is
-                    # explicit and avoids retaining a length-1 time dimension.
-                    profile = ds_roms[["TEMP", "SALT"]].isel(
-                        TSTEP=0, ROW=irow, COL=icol
+                    nearby = ds_roms[["TEMP", "SALT"]].isel(
+                        TSTEP=0,
+                        ROW=slice(row_start, row_stop),
+                        COL=slice(col_start, col_stop),
+                    ).load()
+                    selected = nearest_valid_grid_cell(
+                        lat_values,
+                        lon_values,
+                        nearby["TEMP"].values,
+                        nearby["SALT"].values,
+                        row_start,
+                        col_start,
+                        target_lat,
+                        target_lon,
+                    )
+                    if selected is None:
+                        print(
+                            f"SKIP cast {cast_id}: no valid ROMS ocean profile "
+                            f"within {WET_CELL_SEARCH_RADIUS} grid cell(s) of "
+                            f"WOD position ({target_lon:.4f}, {target_lat:.4f})."
+                        )
+                        n_skipped += 1
+                        continue
+
+                    grid_distance_km, irow, icol = selected
+                    profile = nearby[["TEMP", "SALT"]].isel(
+                        ROW=irow - row_start, COL=icol - col_start
                     ).load()
 
                     model_lat = float(ds_roms["lat"].isel(ROW=irow).values)
@@ -299,6 +419,7 @@ def main():
                         "roms_time": model_time.isoformat(),
                         "roms_lon": model_lon,
                         "roms_lat": model_lat,
+                        "roms_grid_distance_km": grid_distance_km,
                         "time_difference_hours": time_diff.total_seconds() / 3600.0,
                         "source_roms_file": str(roms_file),
                         "source_wod_file": str(args.wod_file),
@@ -321,7 +442,8 @@ def main():
                 print(
                     f"[{n}/{ncasts}] cast {cast_id}: "
                     f"WOD={target_time}, ROMS={model_time}, "
-                    f"dt={time_diff}, grid=({model_lon:.4f}, {model_lat:.4f})"
+                    f"dt={time_diff}, grid=({model_lon:.4f}, {model_lat:.4f}), "
+                    f"grid_distance={grid_distance_km:.3f} km"
                 )
 
             except Exception as exc:
