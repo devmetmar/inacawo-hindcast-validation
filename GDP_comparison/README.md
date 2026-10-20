@@ -41,8 +41,9 @@ by this entrypoint.
 
 ## Outputs
 
-Results are written under
-`/scratch/cawohdcst/data/hindcast_comparison/GDP_comparison/`:
+GDP input files are read from
+`/scratch/cawohdcst/data/hindcast_comparison/GDP_comparison/`. Results are
+written under `$HOME/inacawo-hindcast-validation/GDP_comparison/`:
 
 - Extracted GDP records with ROMS currents:
   `extracted/YYYYMMDD-YYYYMMDD/YYYY/gdp_roms_uv10m_<drifter-id>.nc`
